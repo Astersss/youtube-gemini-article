@@ -1,41 +1,50 @@
-# Cloudflare Workers
+# AI Coding Instructions — youtube-gemini-article
 
-STOP. Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any Workers, KV, R2, D1, Durable Objects, Queues, Vectorize, AI, or Agents SDK task.
+## Project Context
+- **Runtime:** Cloudflare Workers (ES Modules, V8 isolates) — `nodejs_compat` flag enabled
+- **Purpose:** Stream a Gemini-generated Chinese article from a YouTube video URL
+- **Constraint:** Zero npm runtime dependencies — use only Web Standard APIs
 
-## Docs
+## Module Layout
+| File | Role |
+|------|------|
+| `src/index.js` | Router: `GET /` → HTML page, `GET /api/article?url=` → streaming pipeline |
+| `src/services/youtube.js` | `extractVideoId(url)`, `fetchTranscript(videoId)` |
+| `src/services/gemini.js` | `streamArticle(transcript, apiKey)` → `ReadableStream<string>` of markdown |
+| `src/templates/ui.js` | `renderPage()` → complete HTML/CSS/JS as a template literal string |
 
-- https://developers.cloudflare.com/workers/
-- MCP: `https://docs.mcp.cloudflare.com/mcp`
+## Technical Rules
+1. **Secrets via `env`** — access `env.GEMINI_API_KEY`, never `process.env`
+2. **Error before stream** — all validation and external API calls must complete *before* returning the streaming `Response`. Once a streaming response starts, HTTP status cannot change.
+3. **Streaming pipeline** — Gemini SSE → `extractGeminiText()` TransformStream → plain text string chunks → `TextEncoderStream` → `Response`
+4. **Markdown output** — Gemini outputs Markdown; the frontend `md2html()` converts to HTML client-side. Never stream raw HTML fragments from the server.
+5. **No external libraries** — use `fetch`, `RegExp`, `TransformStream`, `TextEncoderStream`, `TextDecoderStream` only
 
-For all limits and quotas, retrieve from the product's `/platform/limits/` page. eg. `/workers/platform/limits`
+## Gemini API
+- Endpoint: `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key={KEY}`
+- SSE line format: `data: {"candidates":[{"content":{"parts":[{"text":"..."}],"role":"model"}}]}`
+- API key stored as a Worker secret: `npx wrangler secret put GEMINI_API_KEY`
+- For local dev: store in `.dev.vars` as `GEMINI_API_KEY=your_key_here`
 
-## Commands
+## YouTube Subtitle Extraction
+- Fetch `https://www.youtube.com/watch?v={id}` with browser-like `User-Agent` + `Accept-Language` headers
+- Regex `/"captionTracks":\[.*?"baseUrl":"([^"]+)"/` extracts the first caption track URL
+- Unescape `\\u0026` → `&` before fetching the URL
+- Parse `<text>` elements from the timedtext XML, decode HTML entities, join with spaces
 
-| Command | Purpose |
-|---------|---------|
-| `npx wrangler dev` | Local development |
-| `npx wrangler deploy` | Deploy to Cloudflare |
-| `npx wrangler types` | Generate TypeScript types |
+## Local Development
+```bash
+# 1. Create .dev.vars at project root (git-ignored by Wrangler)
+echo 'GEMINI_API_KEY=your_key_here' > .dev.vars
 
-Run `wrangler types` after changing bindings in wrangler.jsonc.
+# 2. Start local dev server
+npx wrangler dev
 
-## Node.js Compatibility
+# 3. Open http://localhost:8787
+```
 
-https://developers.cloudflare.com/workers/runtime-apis/nodejs/
-
-## Errors
-
-- **Error 1102** (CPU/Memory exceeded): Retrieve limits from `/workers/platform/limits/`
-- **All errors**: https://developers.cloudflare.com/workers/observability/errors/
-
-## Product Docs
-
-Retrieve API references and limits from:
-`/kv/` · `/r2/` · `/d1/` · `/durable-objects/` · `/queues/` · `/vectorize/` · `/workers-ai/` · `/agents/`
-
-## Best Practices (conditional)
-
-If the application uses Durable Objects or Workflows, refer to the relevant best practices:
-
-- Durable Objects: https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/
-- Workflows: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+## Deployment
+```bash
+npx wrangler secret put GEMINI_API_KEY   # paste key when prompted
+npm run deploy
+```
