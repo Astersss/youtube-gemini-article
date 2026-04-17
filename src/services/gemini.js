@@ -35,15 +35,38 @@ const SYSTEM_PROMPT = `你是一位资深的中文内容编辑，擅长将各类
 - 若确实找不到姓名，才可用简洁角色代称（如 **主持人:** **嘉宾:**）
 - 同一人连续表达同一观点的多段字幕，合并为一个完整段落
 
-【内容完整性】
-- 覆盖字幕中讨论的每一个话题，不遗漏任何重要内容
-- 每位说话人的核心观点、数据、案例都必须完整呈现
-- 不要过度压缩：保持原有的信息密度，每个话题至少展开2-3个段落
+【内容处理原则】
+目标：像专业编辑整理采访稿——去粗取精，保留每段话最有价值的核心，而非逐字翻译。
+
+必须保留（对话类）：
+- 提问者 / 主持人的每一个问题——问题是对话的骨架，绝不可省略
+- 问题需重新提炼：删去过渡语和元评论（"这是个好问题""我们收到了一些问题""顺着这个话题"），将核心疑问重写为自然流畅的一句话，可补充必要背景让问题更有力
+  · 原文："这是一个很好的过渡……所以我将从一个大话题开始：你和本在什么事情上求同存异？"
+  · 重写后："在您与 Ben 超过30年的合作中，有哪些事情是你们存在分歧但最终达成共识的？"
+
+删除（整段不写）：
+- 玩笑、调侃、来回的闲聊式互动（如"恋情早已消逝""是的是的是的"这类无信息量的交换）
+- 主持人的过渡语和衔接句（如"这是一个很好的过渡""在我们进入下一话题之前"）
+- 口头填充词（um, uh, you know, like）、"让我解释一下"式引导语
+- 同一观点的重复强调（保留最清晰的一次表述）
+
+保留并压缩：
+- 每位说话人对每个话题的核心回应：提炼为 2-3 段，每段一个核心观点
+- 关键数字、数据、具体案例（一句带过即可，不展开细节）
+- 服务于论点的历史背景（只保留直接支撑论点的部分）
+
+覆盖：字幕中出现的每一个话题，都必须在文章中体现
 
 【翻译与润色】
 - 译为流畅自然的中文，删除口头填充词（um, uh, you know, like, 呃, 啊, 就是说）
 - 保留具体数字、人名、地名、专有名词等关键信息，不可省略
 - 意译优先：忠实原意，用中文读者习惯的表达，而非逐词直译
+
+【章节标记（可选）】
+字幕中可能包含 [CHAPTER: 标题] 标记，标注每章的起始位置和主题。
+- 若存在章节标记，以章节为单位组织文章结构，章节标题可作为 ## 大章节的灵感来源
+- 若第一章标题含有 Introduction / Intro / Preview / Highlights / Teaser / Recap 等词，且其内容明显是后续内容的剪辑重复（而非独立的开场介绍），则跳过该章，从第二章起开始撰写文章
+- 若无章节标记，按内容自然分章
 
 【输出格式】
 - 直接从 # 大标题开始，结尾无需总结
@@ -53,20 +76,52 @@ const SYSTEM_PROMPT = `你是一位资深的中文内容编辑，擅长将各类
 
 
 /**
+ * Builds a chapter-annotated transcript string from timed lines and chapter list.
+ *
+ * If chapters are available, inserts [CHAPTER: title] markers at each chapter boundary
+ * so Gemini can use them for structure and intro-skipping.
+ * If no chapters, falls back to a plain joined string.
+ *
+ * @param {{text: string, startMs: number}[]} lines
+ * @param {{title: string, startMs: number}[]} chapters
+ * @returns {string}
+ */
+function buildAnnotatedTranscript(lines, chapters) {
+  if (chapters.length === 0) {
+    return lines.map(l => l.text).join(' ');
+  }
+
+  const parts = [];
+  let nextChapterIdx = 0;
+
+  for (const line of lines) {
+    // Insert chapter marker(s) as we reach each chapter's start time
+    while (nextChapterIdx < chapters.length && line.startMs >= chapters[nextChapterIdx].startMs) {
+      parts.push(`\n\n[CHAPTER: ${chapters[nextChapterIdx].title}]\n`);
+      nextChapterIdx++;
+    }
+    parts.push(line.text);
+  }
+
+  return parts.join(' ');
+}
+
+/**
  * Calls Gemini streamGenerateContent and returns a ReadableStream of plain markdown text.
  * The SSE envelope is stripped by the extractGeminiText TransformStream.
  *
  * Pipeline: res.body → TextDecoderStream → extractGeminiText → ReadableStream<string>
  *
- * @param {string} transcript - Plain-text transcript from YouTube
- * @param {string} apiKey     - Gemini AI Studio API key (from env.GEMINI_API_KEY)
+ * @param {{lines: {text: string, startMs: number}[], chapters: {title: string, startMs: number}[]}} transcriptData
+ * @param {string} apiKey - Gemini AI Studio API key (from env.GEMINI_API_KEY)
  * @returns {Promise<ReadableStream<string>>} Stream of markdown text chunks
  * @throws {Error} If Gemini returns a non-2xx status (thrown before streaming starts)
  */
-export async function streamArticle(transcript, apiKey) {
-  const capped = transcript.length > MAX_TRANSCRIPT_CHARS
-    ? transcript.slice(0, MAX_TRANSCRIPT_CHARS) + '…'
-    : transcript;
+export async function streamArticle({ lines, chapters }, apiKey) {
+  const full = buildAnnotatedTranscript(lines, chapters);
+  const capped = full.length > MAX_TRANSCRIPT_CHARS
+    ? full.slice(0, MAX_TRANSCRIPT_CHARS) + '…'
+    : full;
 
   const res = await fetch(API_URL + apiKey, {
     method: 'POST',

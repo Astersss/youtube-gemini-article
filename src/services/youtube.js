@@ -8,20 +8,19 @@ export function extractVideoId(url) {
 }
 
 /**
- * Fetches the plain-text transcript for a YouTube video.
+ * Fetches transcript lines (with timestamps) and chapter list for a YouTube video.
+ *
+ * Returns: { lines: [{text, startMs}], chapters: [{title, startMs}] }
  *
  * Strategy:
- * 1. Fetch the watch page to extract the InnerTube API key.
- * 2. POST to /youtubei/v1/player with ANDROID client context to get captionTracks.
- * 3. Fetch the timedtext XML URL from the player response.
- * 4. Parse the XML into plain text.
- *
- * Using the ANDROID client is key: it returns timedtext URLs that work server-side,
- * unlike the signed URLs returned by the WEB client (which return 200 with empty body
- * when fetched outside a real browser session).
+ * 1. Fetch the watch page — extracts InnerTube API key + chapter data (ytInitialData).
+ * 2. POST to /youtubei/v1/player with ANDROID client — gets captionTracks URLs.
+ *    (ANDROID client returns timedtext URLs that work server-side, unlike WEB client.)
+ * 3. Fetch the timedtext XML — parse into {text, startMs} pairs preserving timestamps.
+ * 4. Chapters are optional: empty array if the video has none.
  */
 export async function fetchTranscript(videoId) {
-  // Step 1 — fetch page and extract InnerTube API key
+  // Step 1 — fetch page, extract API key and chapter data
   const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -32,9 +31,12 @@ export async function fetchTranscript(videoId) {
   if (!pageRes.ok) throw new Error(`YouTube fetch failed: HTTP ${pageRes.status}`);
 
   const html = await pageRes.text();
+
   const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
   const apiKey = apiKeyMatch?.[1];
   if (!apiKey) throw new Error('Could not extract InnerTube API key from YouTube page.');
+
+  const chapters = extractChapters(html);
 
   // Step 2 — call /player with ANDROID context to get captionTracks URLs
   const playerRes = await fetch(
@@ -56,17 +58,50 @@ export async function fetchTranscript(videoId) {
 
   // Prefer English, fall back to first available track
   const track = tracks.find(t => t.languageCode === 'en') ?? tracks[0];
-  const timedtextUrl = track.baseUrl;
 
   // Step 3 — fetch the timedtext XML
-  const xmlRes = await fetch(timedtextUrl);
+  const xmlRes = await fetch(track.baseUrl);
   if (!xmlRes.ok) throw new Error(`Timedtext fetch failed: HTTP ${xmlRes.status}`);
 
   const xml = await xmlRes.text();
   if (!xml) throw new Error('Timedtext returned empty response.');
 
-  // Step 4 — parse XML into plain text
-  return parseTimedtextXml(xml);
+  // Step 4 — parse XML into {text, startMs} pairs
+  const lines = parseTimedtextXml(xml);
+  if (lines.length === 0) throw new Error('No subtitles found. The video may have captions disabled.');
+
+  return { lines, chapters };
+}
+
+/**
+ * Extracts YouTube chapter list from the ytInitialData blob embedded in the watch page.
+ * Returns [{title, startMs}] sorted by startMs, or [] if the video has no chapters.
+ */
+function extractChapters(html) {
+  try {
+    const match = html.match(/ytInitialData\s*=\s*(\{.+?\})\s*;/s);
+    if (!match) return [];
+    const data = JSON.parse(match[1]);
+
+    const markersMap =
+      data?.playerOverlays
+          ?.playerOverlayRenderer
+          ?.decoratedPlayerBarRenderer
+          ?.decoratedPlayerBarRenderer
+          ?.playerBar
+          ?.multiMarkersPlayerBarRenderer
+          ?.markersMap ?? [];
+
+    const entry = markersMap.find(m => m.key === 'DESCRIPTION_CHAPTERS');
+    const raw = entry?.value?.chapters ?? [];
+
+    return raw.map(c => ({
+      title: c.chapterRenderer.title.simpleText,
+      startMs: c.chapterRenderer.timeRangeStartMillis,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function decodeEntities(str) {
@@ -80,23 +115,24 @@ function decodeEntities(str) {
 }
 
 /**
- * Parses the timedtext XML returned by the ANDROID player endpoint into plain text.
+ * Parses timedtext XML into an array of {text, startMs} objects.
  *
- * The ANDROID format uses word-level <s> elements inside <p> cues:
- *   <p t="160" d="3600"><s>this</s><s t="160"> new</s><s t="640"> wave</s></p>
+ * ANDROID format — word-level <s> elements inside timed <p> cues:
+ *   <p t="160" d="3600"><s>this</s><s t="160"> new</s></p>
  *
- * Older auto-generated captions also use the basic <text> element format.
+ * Fallback — simple <text start="0.16" dur="..."> format.
  */
 function parseTimedtextXml(xml) {
   const lines = [];
 
-  // Try word-level format first (<p>/<s> elements)
-  const pRegex = /<p[^>]*>(.*?)<\/p>/gs;
+  // Primary: <p t="..."> / <s> word-level format
+  const pRegex = /<p\b[^>]*\bt="(\d+)"[^>]*>(.*?)<\/p>/gs;
   const sRegex = /<s[^>]*>([^<]*)<\/s>/g;
 
   let pMatch;
   while ((pMatch = pRegex.exec(xml)) !== null) {
-    const pContent = pMatch[1];
+    const startMs = parseInt(pMatch[1], 10);
+    const pContent = pMatch[2];
     const words = [];
     let sMatch;
     while ((sMatch = sRegex.exec(pContent)) !== null) {
@@ -104,24 +140,19 @@ function parseTimedtextXml(xml) {
     }
     sRegex.lastIndex = 0;
     const text = decodeEntities(words.join('').trim());
-    if (text) lines.push(text);
+    if (text) lines.push({ text, startMs });
   }
 
-  // Fall back to simple <text> element format
+  // Fallback: <text start="0.16"> simple format
   if (lines.length === 0) {
-    const textRegex = /<text[^>]*>([^<]*)<\/text>/g;
+    const textRegex = /<text\b[^>]*\bstart="([^"]+)"[^>]*>([^<]*)<\/text>/g;
     let m;
     while ((m = textRegex.exec(xml)) !== null) {
-      const text = m[1]
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .trim();
-      if (text) lines.push(text);
+      const startMs = Math.round(parseFloat(m[1]) * 1000);
+      const text = decodeEntities(m[2].trim());
+      if (text) lines.push({ text, startMs });
     }
   }
 
-  return lines.join(' ') || null;
+  return lines;
 }

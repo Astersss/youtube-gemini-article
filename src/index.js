@@ -27,16 +27,16 @@ async function handleArticle(searchParams, env) {
 
   // Validate and fetch transcript before opening the stream.
   // Once a streaming Response is returned, HTTP status cannot change.
-  let transcript;
+  let transcriptData;
   try {
-    transcript = await fetchTranscript(videoId);
+    transcriptData = await fetchTranscript(videoId);
   } catch (err) {
     return jsonError(err.message, 502);
   }
 
   let textStream;
   try {
-    textStream = await streamArticle(transcript, env.GEMINI_API_KEY);
+    textStream = await streamArticle(transcriptData, env.GEMINI_API_KEY);
   } catch (err) {
     return jsonError(err.message, 502);
   }
