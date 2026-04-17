@@ -1,14 +1,13 @@
 import { extractVideoId, fetchTranscript } from './services/youtube.js';
-import { streamArticle }                   from './services/gemini.js';
-import { renderPage }                      from './templates/ui.js';
+import { streamArticle } from './services/gemini.js';
+import { renderPage } from './templates/ui.js';
 
 export default {
   async fetch(request, env) {
     const { pathname, searchParams } = new URL(request.url);
 
-    if (pathname === '/')            return serveUI();
-    if (pathname === '/api/article') return handleArticle(searchParams, env);
-
+    if (pathname === '/')              return serveUI();
+    if (pathname === '/api/article')   return handleArticle(searchParams, env);
     return new Response('Not Found', { status: 404 });
   },
 };
