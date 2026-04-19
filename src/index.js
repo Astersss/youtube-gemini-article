@@ -36,7 +36,7 @@ async function handleArticle(searchParams, env) {
 
   let textStream;
   try {
-    textStream = await streamArticle(transcriptData, env.GEMINI_API_KEY);
+    textStream = await streamArticle(transcriptData, { apiKey: env.GEMINI_API_KEY, model: env.GEMINI_MODEL });
   } catch (err) {
     return jsonError(err.message, 502);
   }

@@ -227,16 +227,21 @@ export function renderPage() {
           throw new Error(payload.error || res.statusText);
         }
 
-        setLoading(true, 'AI 正在生成文章…');
+        setLoading(true, 'AI 正在思考…');
 
         const reader  = res.body.getReader();
         const decoder = new TextDecoder();
         let raw = '';
+        let firstChunk = true;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           raw += decoder.decode(value, { stream: true });
+          if (firstChunk && raw.trim()) {
+            firstChunk = false;
+            setLoading(true, 'AI 正在生成文章…');
+          }
           article.innerHTML = md2html(raw) + '<span class="cursor"></span>';
           article.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
