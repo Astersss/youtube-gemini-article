@@ -18,7 +18,12 @@
 	//   npx wrangler secret put GEMINI_API_KEY
 	"vars": {
 		"GEMINI_MODEL": "gemini-2.5-flash"
-	}
+	},
+	// Bundle .md files as plain text so we can `import promptText from './foo.md'`.
+	// fallthrough lets wrangler's default Text rule (.txt/.html/.sql) keep working.
+	"rules": [
+		{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }
+	]
 	/**
 	 * Static Assets
 	 * https://developers.cloudflare.com/workers/static-assets/binding/
