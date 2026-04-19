@@ -287,6 +287,43 @@ function buildAnnotatedTranscript(lines, chapters) {
 }
 
 /**
+ * Builds a hard structural manifest enumerating every chapter the model must produce.
+ *
+ * Pure prompt prohibitions ("严禁合并相邻章节") proved insufficient: the model still
+ * fuses adjacent chapters under a single ##. The manifest fixes the count, order, and
+ * one-to-one mapping up front so the model cannot drift. Title text may still be
+ * creatively rewritten per chapter.
+ *
+ * Returns an empty string for chapter-less videos — those fall back to the prompt's
+ * "无章节标记时" branch (LLM picks ## boundaries by natural topic shifts).
+ */
+function buildChapterManifest(chapters) {
+  if (chapters.length === 0) return '';
+
+  const list = chapters.map((c, i) => `${i + 1}. ${c.title}`).join('\n');
+  const n = chapters.length;
+
+  return `【硬性骨架要求（最高优先级，违反即视为输出失败）】
+本视频共有 ${n} 个 YouTube 章节。你的输出**必须**恰好包含 ${n} 个 ## 大章节，按下列顺序与章节一一对应（第 i 个 ## 对应第 i 章）：
+
+${list}
+
+规则（不可协商）：
+- **第 1 个 ##** 对应第 1 章「${chapters[0].title}」，按 SYSTEM_PROMPT 里【Introduction / Highlights 章节的处理】流程产出（teaser ### 群）。
+- **第 2 到第 ${n} 个 ##** 与第 2 到第 ${n} 章严格一一对应。每个 ## 标题可基于对应章节标题**创意性地重写为有信息感的中文（杂志式措辞）**，但：
+  · **严禁**把多个相邻章节合并到同一个 ##（哪怕话题看似相关）
+  · **严禁**把一个章节拆成多个 ##
+  · **严禁**调整章节顺序、跳过任何章节、或新增字幕中不存在的章节
+- **落笔前自检**：动笔前先数一遍——你计划输出的 ## 数量是否严格等于 ${n}？不等就是错，必须重排。
+- **落笔过程中自检**：每写完一个 ## 大章节，对照上面清单确认下一个该写哪一章；遇到字幕里 [CHAPTER: ...] 标记切换时，必须立刻收尾当前 ## 并起一个新的 ##。
+
+────────────────────────────────────────
+【字幕原文（含 [CHAPTER:] 标记）】
+
+`;
+}
+
+/**
  * Calls Gemini streamGenerateContent and returns a ReadableStream of plain markdown text.
  * The SSE envelope is stripped by the extractGeminiText TransformStream.
  *
@@ -303,10 +340,14 @@ export async function streamArticle({ lines, chapters }, { apiKey, model }) {
     ? full.slice(0, MAX_TRANSCRIPT_CHARS) + '…'
     : full;
 
+  const manifest = buildChapterManifest(chapters);
+  const userMessage = manifest + capped;
+
   // Diagnostic: log chapter structure to terminal so we can see what Gemini receives
   console.log(`[gemini] model: ${model}`);
   console.log(`[gemini] transcript stats: ${lines.length} lines, ${full.length} chars (capped: ${capped.length})`);
   console.log(`[gemini] chapters (${chapters.length}):`, chapters.map(c => `[${Math.round(c.startMs / 1000)}s] ${c.title}`).join(' | ') || '(none)');
+  console.log(`[gemini] manifest: ${manifest ? `enforcing ${chapters.length} ## sections` : 'none (no chapters → freeform structure)'}`);
 
   const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
   const res = await fetch(apiUrl, {
@@ -314,7 +355,7 @@ export async function streamArticle({ lines, chapters }, { apiKey, model }) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: capped }] }],
+      contents: [{ role: 'user', parts: [{ text: userMessage }] }],
       generationConfig: {
         temperature: 0.3,
         maxOutputTokens: 32768,
