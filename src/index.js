@@ -29,7 +29,7 @@ async function handleArticle(searchParams, env) {
   // Once a streaming Response is returned, HTTP status cannot change.
   let transcriptData;
   try {
-    transcriptData = await fetchTranscript(videoId);
+    transcriptData = await fetchTranscript(videoId, env);
   } catch (err) {
     return jsonError(err.message, 502);
   }
