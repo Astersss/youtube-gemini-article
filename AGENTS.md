@@ -10,14 +10,17 @@
 |------|------|
 | `src/index.js` | Router: `GET /` → HTML page, `GET /api/article?url=` → streaming pipeline |
 | `src/services/youtube.js` | `extractVideoId(url)`, `fetchTranscript(videoId)` |
-| `src/services/gemini.js` | `streamArticle(transcript, apiKey)` → `ReadableStream<string>` of markdown |
+| `src/services/gemini.js` | `streamArticle(transcript, config)` — calls Gemini with `responseSchema`, pipes SSE → SectionStreamer → `ReadableStream<string>` of Markdown |
+| `src/services/schema.js` | `ARTICLE_SCHEMA` — JSON schema passed to Gemini's `responseSchema` |
+| `src/services/renderer.js` | `renderPreamble` / `renderChapterHeading` / `renderSection` / `renderArticle` — pure JSON→Markdown fragments |
+| `src/services/stream-render.js` | `tryLenientParse` + `SectionStreamer` — consume JSON text chunks and emit Markdown fragments for each frozen piece |
 | `src/templates/ui.js` | `renderPage()` → complete HTML/CSS/JS as a template literal string |
 
 ## Technical Rules
 1. **Secrets via `env`** — access `env.GEMINI_API_KEY`, never `process.env`
 2. **Error before stream** — all validation and external API calls must complete *before* returning the streaming `Response`. Once a streaming response starts, HTTP status cannot change.
-3. **Streaming pipeline** — Gemini SSE → `extractGeminiText()` TransformStream → plain text string chunks → `TextEncoderStream` → `Response`
-4. **Markdown output** — Gemini outputs Markdown; the frontend `md2html()` converts to HTML client-side. Never stream raw HTML fragments from the server.
+3. **Structured-output streaming pipeline** — Gemini returns JSON shaped by `ARTICLE_SCHEMA` via SSE → `sseTextParts()` TransformStream extracts each `parts[].text` fragment → `SectionStreamer` runs a lenient partial-JSON parse after every fragment and emits Markdown (preamble / chapter heading / full section) the moment each piece is "frozen" (next piece has begun) → `TextEncoderStream` → `Response`. Streaming granularity is per-section, not per-token.
+4. **Markdown is derived, not modeled** — the LLM never sees or emits Markdown syntax; it fills schema fields only. `src/services/renderer.js` owns all `#` / `##` / `###` / `**Name:**` conventions. Keep the frontend `md2html()` unchanged.
 5. **No external libraries** — use `fetch`, `RegExp`, `TransformStream`, `TextEncoderStream`, `TextDecoderStream` only
 
 ## Gemini API

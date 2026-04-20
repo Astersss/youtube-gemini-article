@@ -1,106 +1,126 @@
 import SYSTEM_PROMPT from '../prompts/system.md';
+import { ARTICLE_SCHEMA, CHAPTER_SCHEMA, METADATA_SCHEMA } from './schema.js';
+import { SectionStreamer, ChapterStreamer, tryLenientParse } from './stream-render.js';
+import { renderPreamble } from './renderer.js';
 
-// Gemini 2.5 Flash/Pro support 1M token context; 300k chars ≈ 75k tokens, well within limits
-const MAX_TRANSCRIPT_CHARS = 300000;
+// Gemini 2.5 Flash/Pro support 1M token context; 300k chars ≈ 75k tokens.
+const MAX_TRANSCRIPT_CHARS = 300_000;
+const SEP = '━'.repeat(56);
 
+const SAFETY_OFF = [
+  { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+];
 
-/**
- * Builds a chapter-annotated transcript string from timed lines and chapter list.
- *
- * If chapters are available, inserts [CHAPTER: title] markers at each chapter boundary
- * so Gemini can use them as structural hints (including special handling of
- * Introduction/Highlights preview chapters at the top of the article).
- * If no chapters, falls back to a plain joined string.
- *
- * @param {{text: string, startMs: number}[]} lines
- * @param {{title: string, startMs: number}[]} chapters
- * @returns {string}
- */
-function buildAnnotatedTranscript(lines, chapters) {
-  if (chapters.length === 0) {
-    return lines.map(l => l.text).join(' ');
-  }
+// ── Transcript helpers ────────────────────────────────────────────────────────
 
-  const parts = [];
-  let nextChapterIdx = 0;
+const cap = s => s.length > MAX_TRANSCRIPT_CHARS ? s.slice(0, MAX_TRANSCRIPT_CHARS) + '…' : s;
 
-  for (const line of lines) {
-    // Insert chapter marker(s) as we reach each chapter's start time
-    while (nextChapterIdx < chapters.length && line.startMs >= chapters[nextChapterIdx].startMs) {
-      parts.push(`\n\n[CHAPTER: ${chapters[nextChapterIdx].title}]\n`);
-      nextChapterIdx++;
-    }
-    parts.push(line.text);
-  }
-
-  return parts.join(' ');
+function getChapterLines(lines, chapters, i) {
+  const start = chapters[i].startMs;
+  const end   = chapters[i + 1]?.startMs ?? Infinity;
+  return lines.filter(l => l.startMs >= start && l.startMs < end);
 }
 
+function chapterBlock(i, chapters, chLines) {
+  const ch = chapters[i];
+  const content = cap(chLines.map(l => l.text).join(' '));
+  return `\n\n${SEP}\n【第${i + 1}章 / 共${chapters.length}章】${ch.title}\n→ 本段字幕仅产生 chapters[${i}].sections\n${SEP}\n\n${content}`;
+}
+
+// ── User-message builders ─────────────────────────────────────────────────────
+
 /**
- * Builds a hard structural manifest enumerating every chapter the model must produce.
- *
- * Pure prompt prohibitions ("严禁合并相邻章节") proved insufficient: the model still
- * fuses adjacent chapters under a single ##. The manifest fixes the count, order, and
- * one-to-one mapping up front so the model cannot drift. Title text may still be
- * creatively rewritten per chapter.
- *
- * Returns an empty string for chapter-less videos — those fall back to the prompt's
- * "无章节标记时" branch (LLM picks ## boundaries by natural topic shifts).
+ * Metadata-extraction message: full transcript in, three preamble fields out.
+ * Sees the whole video so speaker names can be found wherever they appear
+ * (often mid-video, not in the highlights/intro chapter).
  */
-function buildChapterManifest(chapters) {
-  if (chapters.length === 0) return '';
-
+function buildMetadataMsg(lines, chapters) {
+  const fullText = cap(lines.map(l => l.text).join(' '));
   const list = chapters.map((c, i) => `${i + 1}. ${c.title}`).join('\n');
-  const n = chapters.length;
+  return `【任务：仅输出 article_title / host_name / guest_name 三个字段，不要输出 chapters 或任何正文】
 
-  return `【章节骨架要求（最高优先级，违反即视为输出失败）】
-本视频共有 ${n} 个 YouTube 章节。你的输出**必须**恰好包含 ${n} 个 ## 大章节，按下列顺序与章节一一对应（第 i 个 ## 对应第 i 章）：
+本视频共 ${chapters.length} 章：
 
 ${list}
 
-- **第 1 个 ##** 对应第 1 章「${chapters[0].title}」，按 SYSTEM_PROMPT 里【Introduction / Highlights 章节的处理】流程产出（teaser ### 群）。
-- **第 2 到第 ${n} 个 ##** 与第 2 到第 ${n} 章严格一一对应。每个 ## 标题应**忠实保留原章节标题的核心要素**（对立项 / 对比关系 / 关键名词 / 专有名词），只在中文表达上润色为更有冲击力的杂志式短语；**严禁**把原标题抽象化、概括化、或丢掉原标题里出现的关键概念与对立结构。
-- **严禁**把多个相邻章节合并到同一个 ##（哪怕话题看似相关）；**严禁**把一个章节拆成多个 ##；**严禁**调整章节顺序、跳过任何章节、或新增字幕中不存在的章节。
-- **落笔前自检**：动笔前先数一遍——你计划输出的 ## 数量是否严格等于 ${n}？不等就是错，必须重排。
-- **落笔过程中自检**：遇到字幕里 [CHAPTER: ...] 标记切换时，必须立刻收尾当前 ##，并起一个新的 ##；同时对照上面清单确认接下来要写的是第几章。
-- **每个 ## 收尾前的强制自检（关键，直接决定输出是否合格）**：写完一个 ## 大章节、即将开始下一个 ## 之前，**逐个扫描**该 ## 内的所有 ### —— **每一个 ### 都必须**以 \`**[提问者名]:**\` 段开头（teaser ### 也不例外）。任何只有 \`**[嘉宾名]:**\` 而没有 \`**[提问者名]:**\` 的 ###（即字幕里此处提问者并未真正换新问题、仅仅是嘉宾连续回答的话题延续），**必须**把它合并回上一个 ###——把 \`**[嘉宾名]:**\` 标注去掉，让这段内容作为上一个 ### 嘉宾回答的下一段（第二段及之后不重复姓名标注）。这一步不可省略，跳过即视为输出失败。
-
-> 注：上述自检对应的完整 Q&A 配对硬约束（"每个 ### 必须有提问段 + 回答段"、"嘉宾跨话题继续讲不另起 ###"等）由 SYSTEM_PROMPT 的【Q&A 结构】section 详细规定，本骨架只负责强制执行自检动作，不复述规则。
+请通读**完整字幕**：
+- 按 SYSTEM_PROMPT 规则识别主持人/嘉宾的真实姓名（保留原语言短名，不要音译）。
+- 主持人姓名常出现在视频中段（"Thanks XXX"、"XXX, what do you think"），务必扫描全文，找不到才用「主持人」/「嘉宾」代称。
+- 拟一个有冲击力的中文 article_title，按以下格式：
+  · 对话/访谈类：「对话{受访者全名}：{基于全片凝练的判断性短语}」，受访者用名+姓或中文全名，不只用姓氏
+  · 演讲/独白类：「{演讲者全名}：{凝练的判断性短语}」
 
 ────────────────────────────────────────
-【字幕原文（含 [CHAPTER:] 标记）】
+【字幕全文】
 
-`;
+${fullText}`;
 }
 
 /**
- * Calls Gemini streamGenerateContent and returns a ReadableStream of plain markdown text.
- * The SSE envelope is stripped by the extractGeminiText TransformStream.
- *
- * Pipeline: res.body → TextDecoderStream → extractGeminiText → ReadableStream<string>
- *
- * @param {{lines: {text: string, startMs: number}[], chapters: {title: string, startMs: number}[]}} transcriptData
- * @param {{apiKey: string, model: string}} config - apiKey from env.GEMINI_API_KEY, model from env.GEMINI_MODEL (e.g. 'gemini-2.5-flash')
- * @returns {Promise<ReadableStream<string>>} Stream of markdown text chunks
- * @throws {Error} If Gemini returns a non-2xx status (thrown before streaming starts)
+ * No-chapter message. Single Gemini call, model sees the full transcript and
+ * decides chapter structure itself. This is the only call where teaser/main
+ * de-duplication rules apply (since both halves are visible in one prompt) —
+ * those rules live here, not in system.md, to keep per-chapter prompts clean.
  */
-export async function streamArticle({ lines, chapters }, { apiKey, model }) {
-  const full = buildAnnotatedTranscript(lines, chapters);
-  const capped = full.length > MAX_TRANSCRIPT_CHARS
-    ? full.slice(0, MAX_TRANSCRIPT_CHARS) + '…'
-    : full;
+function buildNoChapterMsg(lines) {
+  const fullText = cap(lines.map(l => l.text).join(' '));
+  return `这个视频**没有章节标记**，请通读完整字幕后按内容自然话题切分章节，按 schema 输出完整文章。
 
-  const manifest = buildChapterManifest(chapters);
-  const userMessage = manifest + capped;
+【字段产出顺序（极其重要）】
+**必须**先把 article_title、host_name、guest_name 三个字段写完整，再开始写 chapters。下游流式渲染依赖它们先到位。
 
-  // Diagnostic: log chapter structure to terminal so we can see what Gemini receives
-  console.log(`[gemini] model: ${model}`);
-  console.log(`[gemini] transcript stats: ${lines.length} lines, ${full.length} chars (capped: ${capped.length})`);
-  console.log(`[gemini] chapters (${chapters.length}):`, chapters.map(c => `[${Math.round(c.startMs / 1000)}s] ${c.title}`).join(' | ') || '(none)');
-  console.log(`[gemini] manifest: ${manifest ? `enforcing ${chapters.length} ## sections` : 'none (no chapters → freeform structure)'}`);
+【chapters 划分】
+- 按内容自然话题切分，每个 chapter 对应一个独立大话题。
+- 视频开头若是 Introduction / Highlights / Teaser / Preview 类预览段（嘉宾在没被提问的情况下连续讲了几个不同话题的金句，话题跳跃、点到为止），第 1 个 chapter 视为 teaser 章节，按 SYSTEM_PROMPT【Introduction 章节处理】拆 N 个 teaser sections。
+- chapter title 严格按 SYSTEM_PROMPT 的「抽象主题：冲击表述」双栏模板写。
 
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
-  const res = await fetch(apiUrl, {
+【teaser 与正片的去重规则（仅本场景适用——你看得到完整字幕）】
+你看得到完整字幕，可能会发现 teaser 里某个话题在后续正片章节又被详细讨论。处理规则：
+- **teaser section 一律全部保留**，即使该话题正片还会讲。规则是"剪正片不剪 teaser"。
+- 正片和 teaser 的 section title 不能字面重复——正片用体现"多了什么新切面"的标题。
+- 若正片某段只是把 teaser 内容换词复述、没有新案例/论据/历史/结论，该正片段跳过不单独成 section。
+- 独白型 teaser 在正片找到对应详细讨论时，可以借用正片提问作为该 teaser 的 question 字段，但 section 仍放 chapters[0]，**不得**因为"正片才有完整提问"而把该 teaser 内容移入正片章节。
+
+────────────────────────────────────────
+【字幕全文】
+
+${fullText}`;
+}
+
+/**
+ * Per-chapter message. Receives speaker names from the metadata call + only
+ * that chapter's transcript. We deliberately do NOT show article_title here:
+ * repeating the H1 text in the prompt primes the model to put it inside the
+ * H2 `title` field. Instead we point at the YouTube chapter title as the
+ * positive anchor for rewriting.
+ */
+function buildChapterMsg(i, chapters, chLines, ctx) {
+  const ytTitle = chapters[i].title;
+  const isTeaser = i === 0 && /introduction|intro|preview|highlights|teaser|recap|开场|预告|精彩看点/i
+    .test(ytTitle);
+  const teaserNote = isTeaser
+    ? '\n- 第 1 章是 Teaser/Introduction，按 SYSTEM_PROMPT【Introduction 章节处理】流程产出 teaser sections。'
+    : '';
+
+  return `${ctx.host_name ? `主持人：${ctx.host_name}，` : ''}嘉宾：${ctx.guest_name}
+
+第 ${i + 1} 章 / 共 ${chapters.length} 章——按 schema 输出 title 和 sections。
+
+- title 是本章的 H2 章节小标题，请按 SYSTEM_PROMPT【章节 title 双栏结构】要求构造：
+  · 以本章 YouTube 原标题「${ytTitle}」为语义锚点，结合本章字幕实际内容改写为「抽象主题：冲击表述」结构
+  · **硬约束**：title 里**不得**出现"${ctx.guest_name}"${ctx.host_name ? `、"${ctx.host_name}"` : ''}、"对话"、"访谈"、"专访"等词——章节小标题只描述本章主题，不指代访谈本身
+  · **严禁**从任何范本列表里挑选标题；每章都基于该章实际内容现造${teaserNote}
+${chapterBlock(i, chapters, chLines)}`;
+}
+
+// ── Gemini API layer ──────────────────────────────────────────────────────────
+
+async function callGemini(userMessage, schema, { apiKey, model }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -109,83 +129,167 @@ export async function streamArticle({ lines, chapters }, { apiKey, model }) {
       generationConfig: {
         temperature: 0.3,
         maxOutputTokens: 32768,
-        // -1 = dynamic thinking budget (model decides). Pro doesn't support 0.
-        thinkingConfig: { thinkingBudget: -1 },
+        thinkingConfig: { thinkingBudget: 0 },
+        responseMimeType: 'application/json',
+        responseSchema: schema,
       },
-      safetySettings: [
-        { category: 'HARM_CATEGORY_HARASSMENT',        threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_HATE_SPEECH',       threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-      ],
+      safetySettings: SAFETY_OFF,
     }),
   });
 
   if (!res.ok) {
     const body = await res.text();
-    if (res.status === 429) {
-      throw new Error('Gemini API quota exceeded. Please wait a minute and try again, or enable billing at aistudio.google.com.');
-    }
-    if (res.status === 503) {
-      throw new Error('Gemini model is temporarily overloaded. Please wait a minute and try again.');
-    }
+    if (res.status === 429) throw new Error(
+      'Gemini API quota exceeded. Please wait a minute and try again, or enable billing at aistudio.google.com.'
+    );
+    if (res.status === 503) throw new Error(
+      'Gemini model is temporarily overloaded. Please wait a minute and try again.'
+    );
     throw new Error(`Gemini API error ${res.status}: ${body}`);
   }
+  return res;
+}
 
-  return res.body
+/** TransformStream: SSE wire format → inner `parts[].text` strings. */
+function sseTextParts() {
+  let buf = '';
+  const handleLine = (line, controller) => {
+    if (!line.startsWith('data: ')) return;
+    const payload = line.slice(6).trim();
+    if (payload === '[DONE]') return;
+    try {
+      const data = JSON.parse(payload);
+      const candidate = data.candidates?.[0];
+      const text = candidate?.content?.parts?.find(p => !p.thought)?.text;
+      if (text) controller.enqueue(text);
+      const finish = candidate?.finishReason;
+      if (finish && finish !== 'STOP') {
+        console.warn(`[gemini] stream ended with finishReason=${finish}`, data.usageMetadata ?? '');
+      }
+    } catch { /* skip malformed SSE */ }
+  };
+  return new TransformStream({
+    transform(chunk, controller) {
+      buf += chunk;
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) handleLine(line, controller);
+    },
+    flush(controller) {
+      if (buf.startsWith('data: ')) handleLine(buf, controller);
+    },
+  });
+}
+
+/** Read a Gemini SSE response and return the accumulated raw JSON text. */
+async function readJson(res) {
+  const reader = res.body
     .pipeThrough(new TextDecoderStream())
-    .pipeThrough(extractGeminiText());
+    .pipeThrough(sseTextParts())
+    .getReader();
+  let json = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    json += value;
+  }
+  return json;
 }
 
 /**
- * TransformStream that parses Gemini SSE lines and emits only the text content.
- *
- * Input:  string chunks (may span multiple SSE "data: {...}" lines)
- * Output: string chunks of raw markdown text
- *
- * Gemini SSE line format:
- *   data: {"candidates":[{"content":{"parts":[{"text":"..."}],"role":"model"}},...]}
+ * Drain one Gemini SSE response through `streamer`, enqueuing Markdown
+ * fragments into `controller` as each piece freezes.
  */
-function extractGeminiText() {
-  let buffer = '';
+async function drain(res, streamer, controller) {
+  const reader = res.body
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(sseTextParts())
+    .getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const md = streamer.push(value);
+    if (md) controller.enqueue(md);
+  }
+  const tail = streamer.finish();
+  if (tail) controller.enqueue(tail);
+}
 
-  return new TransformStream({
-    transform(chunk, controller) {
-      buffer += chunk;
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep the last incomplete line for the next chunk
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const json = line.slice(6).trim();
-        if (json === '[DONE]') continue;
-        try {
-          const data = JSON.parse(json);
-          const candidate = data.candidates?.[0];
-          const parts = candidate?.content?.parts ?? [];
-          const text = parts.find(p => !p.thought)?.text;
-          if (text) controller.enqueue(text);
-          // Warn on any non-STOP finish (MAX_TOKENS, SAFETY, RECITATION, OTHER, etc.)
-          const finish = candidate?.finishReason;
-          if (finish && finish !== 'STOP') {
-            console.warn(`[gemini] stream ended with finishReason=${finish}`, data.usageMetadata ?? '');
-          }
-        } catch {
-          // skip malformed SSE chunks silently
-        }
+/**
+ * Wraps an async driver in a ReadableStream<string> that closes/errors based
+ * on the driver's resolution.
+ */
+function makeStream(driver) {
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        await driver(controller);
+        controller.close();
+      } catch (err) {
+        controller.error(err);
       }
     },
+  });
+}
 
-    flush(controller) {
-      // process any text left in the buffer when the stream closes
-      if (buffer.startsWith('data: ')) {
-        try {
-          const data = JSON.parse(buffer.slice(6));
-          const parts = data.candidates?.[0]?.content?.parts ?? [];
-          const text = parts.find(p => !p.thought)?.text;
-          if (text) controller.enqueue(text);
-        } catch { /* ignore */ }
-      }
-    },
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Generate a streaming Markdown article from transcript data.
+ *
+ * - **No chapters**: a single Gemini call with the full transcript, model
+ *   decides article structure on its own.
+ * - **With chapters**: one upfront metadata call (full transcript → article_
+ *   title + speaker names), then one call per chapter, sequential. Each
+ *   chapter call sees only its own transcript slice + the shared metadata
+ *   context. This physical isolation eliminates the "+1 chapter offset"
+ *   bug and lets speaker names be found wherever they appear in the video.
+ *
+ * Errors from the metadata call (or, in the no-chapter case, the single
+ * call) throw before a stream is returned. Errors from later chapter calls
+ * surface as stream errors via the controller.
+ *
+ * @param {{ lines: {text:string, startMs:number}[], chapters: {title:string, startMs:number}[] }} transcriptData
+ * @param {{ apiKey: string, model: string }} config
+ * @returns {Promise<ReadableStream<string>>}
+ */
+export async function streamArticle({ lines, chapters }, config) {
+  const fullText = lines.map(l => l.text).join(' ');
+  console.log(`[gemini] model: ${config.model}`);
+  console.log(`[gemini] transcript: ${lines.length} lines, ${fullText.length} chars`);
+  console.log(
+    `[gemini] chapters (${chapters.length}):`,
+    chapters.map(c => `[${Math.round(c.startMs / 1000)}s] ${c.title}`).join(' | ') || '(none)',
+  );
+
+  if (chapters.length === 0) {
+    const res = await callGemini(buildNoChapterMsg(lines), ARTICLE_SCHEMA, config);
+    return makeStream(controller => drain(res, new SectionStreamer(), controller));
+  }
+
+  // Step 1: dedicated metadata call — full transcript in, three fields out.
+  console.log(`[gemini/meta] extracting article_title + speaker names from full transcript`);
+  const metaRes  = await callGemini(buildMetadataMsg(lines, chapters), METADATA_SCHEMA, config);
+  const metaJson = await readJson(metaRes);
+  const meta     = tryLenientParse(metaJson) ?? {};
+  const ctx = {
+    article_title: meta.article_title ?? '',
+    host_name:     meta.host_name     ?? '',
+    guest_name:    meta.guest_name     ?? '',
+  };
+  console.log(`[gemini/meta] title="${ctx.article_title}" host="${ctx.host_name}" guest="${ctx.guest_name}"`);
+
+  // Step 2: emit preamble + N symmetric chapter calls.
+  return makeStream(async controller => {
+    controller.enqueue(renderPreamble({ article_title: ctx.article_title }));
+    for (let i = 0; i < chapters.length; i++) {
+      console.log(`[gemini/ch${i + 1}] chapter ${i + 1}/${chapters.length}`);
+      const res = await callGemini(
+        buildChapterMsg(i, chapters, getChapterLines(lines, chapters, i), ctx),
+        CHAPTER_SCHEMA,
+        config,
+      );
+      await drain(res, new ChapterStreamer(ctx), controller);
+    }
   });
 }
