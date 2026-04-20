@@ -227,12 +227,14 @@ describe('streamArticle (multi-chapter: metadata call + one call per chapter)', 
     ).rejects.toThrow(/Gemini API error 500/);
   });
 
-  it('surfaces a chapter-call HTTP failure as a stream error', async () => {
+  it('emits an in-stream error block on chapter-call HTTP failure (HTTP 200 already sent, must surface in-band)', async () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(mockSseForJson(metaPayload))
       .mockResolvedValueOnce(new Response('overloaded', { status: 503 }))
     );
     const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
-    await expect(drain(stream)).rejects.toThrow(/overloaded/i);
+    const out = await drain(stream);
+    expect(out).toMatch(/## ⚠️ 生成中断/);
+    expect(out).toMatch(/overloaded/i);
   });
 });

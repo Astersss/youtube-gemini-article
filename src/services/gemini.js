@@ -75,7 +75,8 @@ function buildNoChapterMsg(lines) {
 【chapters 划分】
 - 按内容自然话题切分，每个 chapter 对应一个独立大话题。
 - 视频开头若是 Introduction / Highlights / Teaser / Preview 类预览段（嘉宾在没被提问的情况下连续讲了几个不同话题的金句，话题跳跃、点到为止），第 1 个 chapter 视为 teaser 章节，按 SYSTEM_PROMPT【Introduction 章节处理】拆 N 个 teaser sections。
-- chapter title 严格按 SYSTEM_PROMPT 的「抽象主题：冲击表述」双栏模板写。
+- chapter title 严格按 SYSTEM_PROMPT 的「抽象主题：冲击表述」双栏模板写，**不得**是 article_title 的改写或同义复述。
+- sections[].title 是三级标题，使用动态名词短语（见 SYSTEM_PROMPT），**严禁**使用双栏格式（双栏只用于 chapter title）。
 
 【teaser 与正片的去重规则（仅本场景适用——你看得到完整字幕）】
 你看得到完整字幕，可能会发现 teaser 里某个话题在后续正片章节又被详细讨论。处理规则：
@@ -113,6 +114,7 @@ function buildChapterMsg(i, chapters, chLines, ctx) {
   · 以本章 YouTube 原标题「${ytTitle}」为语义锚点，结合本章字幕实际内容改写为「抽象主题：冲击表述」结构
   · **硬约束**：title 里**不得**出现"${ctx.guest_name}"${ctx.host_name ? `、"${ctx.host_name}"` : ''}、"对话"、"访谈"、"专访"等词——章节小标题只描述本章主题，不指代访谈本身
   · **严禁**从任何范本列表里挑选标题；每章都基于该章实际内容现造${teaserNote}
+- sections[].title 是 H3 三级标题：10-18 字动态名词短语（含具象对象 + 方向性动词），**严禁**使用「抽象主题：冒号：冲击表述」双栏格式——双栏格式只属于章节 title（H2），section title 不用冒号。
 ${chapterBlock(i, chapters, chLines)}`;
 }
 
@@ -224,11 +226,15 @@ function makeStream(driver) {
     async start(controller) {
       try {
         await driver(controller);
-        controller.close();
       } catch (err) {
+        // HTTP status is already 200 by the time the stream starts, so errors
+        // can't propagate via response status. Emit them as in-band Markdown
+        // so the client can render them alongside whatever was already streamed.
         console.error('[stream] driver failed:', err?.message, err?.stack);
-        controller.error(err);
+        const msg = err?.message ?? String(err);
+        controller.enqueue(`\n\n## ⚠️ 生成中断\n\n**${msg}**\n\n`);
       }
+      controller.close();
     },
   });
 }
