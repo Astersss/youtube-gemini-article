@@ -226,6 +226,7 @@ function makeStream(driver) {
         await driver(controller);
         controller.close();
       } catch (err) {
+        console.error('[stream] driver failed:', err?.message, err?.stack);
         controller.error(err);
       }
     },
