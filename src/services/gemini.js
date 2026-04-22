@@ -136,9 +136,12 @@ function buildChapterMsg(i, chapters, chLines, ctx) {
 
 第 ${i + 1} 章 / 共 ${chapters.length} 章——按 schema 输出 title 和 sections。
 
-- title 是本章的 H2 章节小标题，请按 SYSTEM_PROMPT【章节 title 双栏结构】要求构造：
-  · 以本章 YouTube 原标题「${ytTitle}」为语义锚点，结合本章字幕实际内容改写为「抽象主题：冲击表述」结构
-  · **硬约束**：title 里**不得**出现"${ctx.guest_name}"${ctx.host_name ? `、"${ctx.host_name}"` : ''}、"对话"、"访谈"、"专访"等词——章节小标题只描述本章主题，不指代访谈本身
+- title 是本章的 H2 章节小标题，请按 SYSTEM_PROMPT【章节 title 双栏结构】+【双模式选择】要求构造：
+  · 以本章 YouTube 原标题「${ytTitle}」为语义锚点，结合本章字幕实际内容改写为"抽象主题：冲击短语/列举"
+  · **双模式判断**：
+    - 本章主持人只问 1-2 个紧密相关的问题、嘉宾围绕它深度展开 → 单主题章，右半用冲击短语
+    - 本章主持人问了 ≥ 3 个跳跃话题（teaser 串联、闪电问答） → 多话题章，右半可用"A、B 与 C"列举
+  · **硬约束**：title 里**不得**出现"${ctx.guest_name}"${ctx.host_name && ctx.host_name !== '主持人' ? `、"${ctx.host_name}"` : ''}、"对话"、"访谈"、"专访"等词——章节小标题只描述本章主题，不指代访谈本身
   · **严禁**从任何范本列表里挑选标题；每章都基于该章实际内容现造${teaserNote}
 - sections[].title 是 H3 三级标题：10-18 字动态名词短语（含具象对象 + 方向性动词），**严禁**使用「抽象主题：冒号：冲击表述」双栏格式——双栏格式只属于章节 title（H2），section title 不用冒号。
 ${chapterBlock(i, chapters, chLines)}`;
