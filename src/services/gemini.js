@@ -1,7 +1,8 @@
 import SYSTEM_PROMPT from '../prompts/system.md';
-import { ARTICLE_SCHEMA, CHAPTER_SCHEMA, METADATA_SCHEMA } from './schema.js';
+import { ARTICLE_SCHEMA, CHAPTER_SCHEMA, NAMES_SCHEMA, TITLE_SCHEMA } from './schema.js';
 import { SectionStreamer, ChapterStreamer, tryLenientParse } from './stream-render.js';
 import { renderPreamble } from './renderer.js';
+import { extractNameSnippets } from './extract-names.js';
 
 // Gemini 2.5 Flash/Pro support 1M token context; 300k chars ≈ 75k tokens.
 const MAX_TRANSCRIPT_CHARS = 300_000;
@@ -32,31 +33,56 @@ function chapterBlock(i, chapters, chLines) {
 
 // ── User-message builders ─────────────────────────────────────────────────────
 
+// ── Names / Title message builders ────────────────────────────────────────────
+
 /**
- * Metadata-extraction message: full transcript in, three preamble fields out.
- * Sees the whole video so speaker names can be found wherever they appear
- * (often mid-video, not in the highlights/intro chapter).
+ * Names-extraction message. Feeds snippet-extracted transcript excerpts
+ * (~1-5k chars) plus the chapter list to the model and asks for host_name /
+ * guest_name only. Much cheaper than the old full-transcript metadata call.
  */
-function buildMetadataMsg(lines, chapters) {
-  const fullText = cap(lines.map(l => l.text).join(' '));
+function buildNamesMsg(lines, chapters) {
+  const snippets = extractNameSnippets(lines, chapters);
+  return `【任务：从下列片段识别主持人/嘉宾姓名，只输出 host_name 和 guest_name 两个字段】
+
+${snippets}
+
+规则：
+- 通读上面的字幕片段，找出主持人（常说"Thanks X""welcome X""X, what do you think"）和嘉宾（常在"my guest is X""嘉宾是X"句中）的名字
+- 保留原语言短名，不要音译（英文名用英文短名，中文名用中文全名）
+- 实在识别不出就留空字符串，下游会渲染成"主持人"/"嘉宾"`;
+}
+
+const INTRO_CHAPTER_PATTERN =
+  /introduction|intro|highlights|teaser|preview|recap|开场|预告|精彩看点/i;
+
+/**
+ * Title-extraction message. Shows the chapter list (core structural signal)
+ * plus the first chapter's transcript IF it looks like an intro/highlights
+ * chapter — those usually contain the episode's core thesis in condensed
+ * form. Otherwise only the chapter list is sent.
+ */
+function buildTitleMsg(lines, chapters) {
   const list = chapters.map((c, i) => `${i + 1}. ${c.title}`).join('\n');
-  return `【任务：仅输出 article_title / host_name / guest_name 三个字段，不要输出 chapters 或任何正文】
 
-本视频共 ${chapters.length} 章：
+  let introBlock = '';
+  if (chapters.length > 0 && INTRO_CHAPTER_PATTERN.test(chapters[0].title)) {
+    const ch0Lines = getChapterLines(lines, chapters, 0);
+    const ch0Text = cap(ch0Lines.map(l => l.text).join(' '));
+    introBlock = `\n\n【第 1 章字幕（${chapters[0].title}，含全片核心判断）】\n\n${ch0Text}`;
+  }
 
-${list}
+  return `【任务：只输出 article_title 一个字段】
 
-请通读**完整字幕**：
-- 按 SYSTEM_PROMPT 规则识别主持人/嘉宾的真实姓名（保留原语言短名，不要音译）。
-- 主持人姓名常出现在视频中段（"Thanks XXX"、"XXX, what do you think"），务必扫描全文，找不到才用「主持人」/「嘉宾」代称。
-- 拟一个有冲击力的中文 article_title，按以下格式：
-  · 对话/访谈类：「对话{受访者全名}：{基于全片凝练的判断性短语}」，受访者用名+姓或中文全名，不只用姓氏
-  · 演讲/独白类：「{演讲者全名}：{凝练的判断性短语}」
+这期视频是访谈/对话类，共 ${chapters.length} 章，结构如下：
 
-────────────────────────────────────────
-【字幕全文】
+${list}${introBlock}
 
-${fullText}`;
+请按以下规则拟标题：
+- 格式必须为："对话{受访者全名}：{凝练的判断性短语}"
+- 受访者全名用名+姓（英文）或中文全名，不能只用姓氏
+- 判断性短语须有"冲突 / 张力 / 转折 / 立场"，不能是"XX谈AI"这种中性描述
+- 【反例】"对话X：AI的未来"（太空泛，没判断）
+- 【正例结构】"对话{全名}：{具体领域}的{具体矛盾或判断}"`;
 }
 
 /**
@@ -297,9 +323,10 @@ export async function streamArticle({ lines, chapters }, config) {
     return makeStream(controller => drain(res, new SectionStreamer(), controller));
   }
 
-  // Step 1: dedicated metadata call — full transcript in, three fields out.
-  console.log(`[gemini/meta] extracting article_title + speaker names from full transcript`);
-  const metaRes  = await callGemini(buildMetadataMsg(lines, chapters), METADATA_SCHEMA, config);
+  // NOTE: Task 4 replaces this with parallel Names + Title calls.
+  // Temporary bridge so the module compiles between tasks.
+  console.log(`[gemini/meta] extracting article_title + speaker names (temporary bridge)`);
+  const metaRes  = await callGemini(buildNamesMsg(lines, chapters), NAMES_SCHEMA, config);
   const metaJson = await readJson(metaRes);
   const meta     = tryLenientParse(metaJson) ?? {};
   const ctx = {
