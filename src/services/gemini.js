@@ -195,13 +195,16 @@ async function callGemini(userMessage, schema, { apiKey, model }) {
     await sleep(delay);
   }
 
-  if (lastStatus === 429) throw new Error(
-    'Gemini API quota exceeded after retries. Please wait a minute and try again, or enable billing at aistudio.google.com.'
+  const mkError = (msg, status) => Object.assign(new Error(msg), { upstreamStatus: status });
+  if (lastStatus === 429) throw mkError(
+    'Gemini API quota exceeded after retries. Please wait a minute and try again, or enable billing at aistudio.google.com.',
+    429,
   );
-  if (lastStatus === 503) throw new Error(
-    'Gemini model is still overloaded after retries. Please wait a minute and try again.'
+  if (lastStatus === 503) throw mkError(
+    'Gemini model is still overloaded after retries. Please wait a minute and try again.',
+    503,
   );
-  throw new Error(`Gemini API error ${lastStatus}: ${lastBody}`);
+  throw mkError(`Gemini API error ${lastStatus}: ${lastBody}`, lastStatus);
 }
 
 /** TransformStream: SSE wire format → inner `parts[].text` strings. */
@@ -326,36 +329,31 @@ export async function streamArticle({ lines, chapters }, config) {
     return makeStream(controller => drain(res, new SectionStreamer(), controller));
   }
 
-  // Step 1: Names + Title in parallel. Names can fail gracefully; Title cannot.
-  console.log(`[gemini/meta] names + title calls (parallel)`);
-  const [namesSettled, titleSettled] = await Promise.allSettled([
-    callGemini(buildNamesMsg(lines, chapters), NAMES_SCHEMA, config),
-    callGemini(buildTitleMsg(lines, chapters), TITLE_SCHEMA, config),
-  ]);
-
-  // Title failure is terminal — abort before opening the stream.
-  if (titleSettled.status === 'rejected') {
-    throw titleSettled.reason;
-  }
-  const titleJson = await readJson(titleSettled.value);
-  const titleData = tryLenientParse(titleJson) ?? {};
-  const article_title = (titleData.article_title ?? '').trim();
-  if (!article_title) {
-    throw new Error('Title call returned empty article_title');
-  }
-
-  // Names failure → fall back to "主持人"/"嘉宾" placeholders.
+  // Step 1a: Names call (failure is graceful — falls back to 主持人/嘉宾).
+  // Sequential before Title so both calls don't hammer Gemini simultaneously.
+  console.log(`[gemini/meta] names call`);
   let host_name = '主持人';
   let guest_name = '嘉宾';
-  if (namesSettled.status === 'fulfilled') {
-    const namesJson = await readJson(namesSettled.value);
+  try {
+    const namesRes  = await callGemini(buildNamesMsg(lines, chapters), NAMES_SCHEMA, config);
+    const namesJson = await readJson(namesRes);
     const namesData = tryLenientParse(namesJson) ?? {};
     const h = (namesData.host_name  ?? '').trim();
     const g = (namesData.guest_name ?? '').trim();
     if (h) host_name  = h;
     if (g) guest_name = g;
-  } else {
-    console.warn('[gemini/names] call failed, falling back to 主持人/嘉宾:', namesSettled.reason?.message);
+  } catch (err) {
+    console.warn('[gemini/names] call failed, falling back to 主持人/嘉宾:', err?.message);
+  }
+
+  // Step 1b: Title call (failure is terminal — abort before opening the stream).
+  console.log(`[gemini/meta] title call`);
+  const titleRes  = await callGemini(buildTitleMsg(lines, chapters), TITLE_SCHEMA, config);
+  const titleJson = await readJson(titleRes);
+  const titleData = tryLenientParse(titleJson) ?? {};
+  const article_title = (titleData.article_title ?? '').trim();
+  if (!article_title) {
+    throw new Error('Title call returned empty article_title');
   }
 
   const ctx = { article_title, host_name, guest_name };

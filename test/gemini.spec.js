@@ -136,7 +136,7 @@ describe('streamArticle', () => {
   });
 });
 
-describe('streamArticle (multi-chapter: names + title calls, then per-chapter calls)', () => {
+describe('streamArticle (multi-chapter: serial names → title, then per-chapter calls)', () => {
   beforeEach(() => vi.restoreAllMocks());
 
   const transcript = {
@@ -171,7 +171,7 @@ describe('streamArticle (multi-chapter: names + title calls, then per-chapter ca
     vi.stubGlobal('fetch', vi.fn(async () => responses[callIdx++]));
   };
 
-  it('makes 2 parallel metadata calls + N chapter calls (total = 2 + N)', async () => {
+  it('makes 2 serial metadata calls + N chapter calls (total = 2 + N)', async () => {
     stubFive();
     const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
     const md = await drain(stream);
@@ -195,10 +195,9 @@ describe('streamArticle (multi-chapter: names + title calls, then per-chapter ca
     const schemaOf = i => JSON.parse(globalThis.fetch.mock.calls[i][1].body).generationConfig.responseSchema;
     const propsOf  = i => Object.keys(schemaOf(i).properties).sort().join(',');
 
-    // Calls 0 and 1 are names + title in parallel (order not guaranteed in real code,
-    // but our stub returns them by index so 0=names 1=title).
-    const firstTwoProps = [propsOf(0), propsOf(1)].sort();
-    expect(firstTwoProps).toEqual(['article_title', 'guest_name,host_name']);
+    // Serial: call 0 is always Names, call 1 is always Title.
+    expect(propsOf(0)).toBe('guest_name,host_name');
+    expect(propsOf(1)).toBe('article_title');
 
     // Calls 2..4 are chapter calls.
     expect(propsOf(2)).toBe('sections,title');
