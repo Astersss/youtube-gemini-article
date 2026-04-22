@@ -105,6 +105,8 @@ describe('streamArticle', () => {
   });
 
   it('throws a friendly error on 429', async () => {
+    // Mock Math.random so retry delays are 0ms (avoids flaky timeouts).
+    vi.spyOn(Math, 'random').mockReturnValue(0);
     vi.stubGlobal('fetch', vi.fn(async () => new Response('quota', { status: 429 })));
     await expect(
       streamArticle(
@@ -134,7 +136,7 @@ describe('streamArticle', () => {
   });
 });
 
-describe('streamArticle (multi-chapter: metadata call + one call per chapter)', () => {
+describe('streamArticle (multi-chapter: names + title calls, then per-chapter calls)', () => {
   beforeEach(() => vi.restoreAllMocks());
 
   const transcript = {
@@ -144,35 +146,37 @@ describe('streamArticle (multi-chapter: metadata call + one call per chapter)', 
       { text: 'second body', startMs: 20_000 },
     ],
     chapters: [
-      { title: '开场预览', startMs:     0 },
-      { title: '硬件',     startMs: 10_000 },
-      { title: '中国',     startMs: 20_000 },
+      { title: 'Introduction', startMs:     0 },
+      { title: '硬件',         startMs: 10_000 },
+      { title: '中国',         startMs: 20_000 },
     ],
   };
 
-  // Call 0: METADATA_SCHEMA shape (no chapters/sections).
-  const metaPayload = {
-    article_title: '对话Mark：AI革命',
-    host_name:     'Jen',
-    guest_name:    'Mark',
+  const namesPayload = { host_name: 'Jen',               guest_name: 'Mark' };
+  const titlePayload = { article_title: '对话Mark：AI革命' };
+  const ch1Payload   = { title: '开场速览', sections: [{ title: 'T1',  question: 'q1', answer_paragraphs: ['a1'] }] };
+  const ch2Payload   = { title: '硬件革命', sections: [{ title: 'GPU', question: 'q2', answer_paragraphs: ['a2'] }] };
+  const ch3Payload   = { title: '中国格局', sections: [{ title: '芯片', question: 'q3', answer_paragraphs: ['a3'] }] };
+
+  // Helper: stub 5 calls by index (names, title, ch1, ch2, ch3).
+  const stubFive = () => {
+    const responses = [
+      mockSseForJson(namesPayload),
+      mockSseForJson(titlePayload),
+      mockSseForJson(ch1Payload),
+      mockSseForJson(ch2Payload),
+      mockSseForJson(ch3Payload),
+    ];
+    let callIdx = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => responses[callIdx++]));
   };
-  // Calls 1..N: CHAPTER_SCHEMA shape.
-  const ch1Payload = { title: '开场速览', sections: [{ title: 'T1',  question: 'q1', answer_paragraphs: ['a1'] }] };
-  const ch2Payload = { title: '硬件革命', sections: [{ title: 'GPU', question: 'q2', answer_paragraphs: ['a2'] }] };
-  const ch3Payload = { title: '中国格局', sections: [{ title: '芯片', question: 'q3', answer_paragraphs: ['a3'] }] };
 
-  const stubFour = () => vi.stubGlobal('fetch', vi.fn()
-    .mockResolvedValueOnce(mockSseForJson(metaPayload))
-    .mockResolvedValueOnce(mockSseForJson(ch1Payload))
-    .mockResolvedValueOnce(mockSseForJson(ch2Payload))
-    .mockResolvedValueOnce(mockSseForJson(ch3Payload)));
-
-  it('makes 1 metadata call + N chapter calls and assembles the document', async () => {
-    stubFour();
+  it('makes 2 parallel metadata calls + N chapter calls (total = 2 + N)', async () => {
+    stubFive();
     const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
     const md = await drain(stream);
 
-    expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(5);
     expect(md).toContain('# 对话Mark：AI革命');
     expect(md).toContain('## 开场速览');
     expect(md).toContain('### T1');
@@ -180,61 +184,98 @@ describe('streamArticle (multi-chapter: metadata call + one call per chapter)', 
     expect(md).toContain('### GPU');
     expect(md).toContain('## 中国格局');
     expect(md).toContain('### 芯片');
-    // Document order matches call order.
     expect(md.indexOf('## 开场速览')).toBeLessThan(md.indexOf('## 硬件革命'));
     expect(md.indexOf('## 硬件革命')).toBeLessThan(md.indexOf('## 中国格局'));
   });
 
-  it('first call uses METADATA_SCHEMA; chapter calls use CHAPTER_SCHEMA', async () => {
-    stubFour();
+  it('names call uses NAMES_SCHEMA, title call uses TITLE_SCHEMA, chapter calls use CHAPTER_SCHEMA', async () => {
+    stubFive();
     await drain(await streamArticle(transcript, { apiKey: 'k', model: 'm' }));
 
     const schemaOf = i => JSON.parse(globalThis.fetch.mock.calls[i][1].body).generationConfig.responseSchema;
-    // Metadata: only the 3 preamble fields, no chapters.
-    expect(schemaOf(0).required).toEqual(
-      expect.arrayContaining(['article_title', 'host_name', 'guest_name'])
-    );
-    expect(Object.keys(schemaOf(0).properties)).not.toContain('chapters');
-    // Chapter calls: only title + sections.
-    expect(schemaOf(1).required).toEqual(expect.arrayContaining(['title', 'sections']));
-    expect(Object.keys(schemaOf(1).properties)).not.toContain('article_title');
-    expect(schemaOf(3).required).toEqual(expect.arrayContaining(['title', 'sections']));
+    const propsOf  = i => Object.keys(schemaOf(i).properties).sort().join(',');
+
+    // Calls 0 and 1 are names + title in parallel (order not guaranteed in real code,
+    // but our stub returns them by index so 0=names 1=title).
+    const firstTwoProps = [propsOf(0), propsOf(1)].sort();
+    expect(firstTwoProps).toEqual(['article_title', 'guest_name,host_name']);
+
+    // Calls 2..4 are chapter calls.
+    expect(propsOf(2)).toBe('sections,title');
+    expect(propsOf(3)).toBe('sections,title');
+    expect(propsOf(4)).toBe('sections,title');
   });
 
-  it('chapter calls carry speaker names + YouTube chapter title, but NOT article_title', async () => {
-    stubFour();
-    await drain(await streamArticle(transcript, { apiKey: 'k', model: 'm' }));
+  it('title call failure throws before stream opens', async () => {
+    const responses = [
+      mockSseForJson(namesPayload),
+      new Response('overloaded', { status: 503 }),
+    ];
+    let callIdx = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => responses[callIdx++]));
 
-    const userMsgOf = i => JSON.parse(globalThis.fetch.mock.calls[i][1].body).contents[0].parts[0].text;
-    // Metadata call: full transcript, IS the preamble extractor.
-    expect(userMsgOf(0)).toContain('article_title');
-    // Chapter calls 1..3: speaker names + YouTube chapter title as positive anchor.
-    // Article_title is intentionally OMITTED — repeating the H1 text in chapter
-    // prompts primes the model to emit it inside the H2 title field.
-    const ytTitles = ['开场预览', '硬件', '中国'];
-    for (const i of [1, 2, 3]) {
-      expect(userMsgOf(i)).toContain('主持人：Jen');
-      expect(userMsgOf(i)).toContain('嘉宾：Mark');
-      expect(userMsgOf(i)).toContain(ytTitles[i - 1]);
-      expect(userMsgOf(i)).not.toContain('对话Mark：AI革命');
-    }
+    await expect(
+      streamArticle(transcript, { apiKey: 'k', model: 'm' })
+    ).rejects.toThrow();
   });
 
-  it('throws (does not return a stream) on metadata-call HTTP failure', async () => {
+  it('names call failure falls back to "主持人"/"嘉宾" and stream continues', async () => {
+    // Mock Math.random so retry delays are 0ms (avoids test timeouts).
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    let chapterCallCount = 0;
+    const chapterPayloads = [ch1Payload, ch2Payload, ch3Payload];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      const props = Object.keys(body.generationConfig.responseSchema.properties).sort().join(',');
+      if (props === 'guest_name,host_name') return new Response('overloaded', { status: 503 });
+      if (props === 'article_title')        return mockSseForJson(titlePayload);
+      return mockSseForJson(chapterPayloads[chapterCallCount++]);
+    }));
+
+    const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
+    const md = await drain(stream);
+
+    expect(md).toContain('# 对话Mark：AI革命');
+    expect(md).toContain('**主持人:** q1');
+    expect(md).toContain('**嘉宾:** a1');
+  });
+
+  it('chapter-call HTTP failure surfaces in-stream (after names+title succeed)', async () => {
+    // Mock Math.random so retry delays are 0ms (avoids test timeouts).
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      const props = Object.keys(body.generationConfig.responseSchema.properties).sort().join(',');
+      if (props === 'guest_name,host_name') return mockSseForJson(namesPayload);
+      if (props === 'article_title')        return mockSseForJson(titlePayload);
+      return new Response('overloaded', { status: 503 }); // all chapter calls fail
+    }));
+
+    const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
+    const out = await drain(stream);
+    expect(out).toMatch(/## ⚠️ 生成中断/);
+    expect(out).toMatch(/overloaded/i);
+  });
+
+  it('throws on title-call HTTP 500 before stream opens', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })));
     await expect(
       streamArticle(transcript, { apiKey: 'k', model: 'm' })
     ).rejects.toThrow(/Gemini API error 500/);
   });
 
-  it('emits an in-stream error block on chapter-call HTTP failure (HTTP 200 already sent, must surface in-band)', async () => {
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(mockSseForJson(metaPayload))
-      .mockResolvedValueOnce(new Response('overloaded', { status: 503 }))
-    );
-    const stream = await streamArticle(transcript, { apiKey: 'k', model: 'm' });
-    const out = await drain(stream);
-    expect(out).toMatch(/## ⚠️ 生成中断/);
-    expect(out).toMatch(/overloaded/i);
+  it('chapter calls carry speaker names + YouTube chapter title, no article_title', async () => {
+    stubFive();
+    await drain(await streamArticle(transcript, { apiKey: 'k', model: 'm' }));
+
+    const userMsgOf = i => JSON.parse(globalThis.fetch.mock.calls[i][1].body).contents[0].parts[0].text;
+    const ytTitles = ['Introduction', '硬件', '中国'];
+    for (let i = 0; i < 3; i++) {
+      const msg = userMsgOf(i + 2); // chapter calls start at index 2
+      expect(msg).toContain('主持人：Jen');
+      expect(msg).toContain('嘉宾：Mark');
+      expect(msg).toContain(ytTitles[i]);
+      expect(msg).not.toContain('对话Mark：AI革命');
+    }
   });
 });

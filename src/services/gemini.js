@@ -323,22 +323,44 @@ export async function streamArticle({ lines, chapters }, config) {
     return makeStream(controller => drain(res, new SectionStreamer(), controller));
   }
 
-  // NOTE: Task 4 replaces this with parallel Names + Title calls.
-  // Temporary bridge so the module compiles between tasks.
-  console.log(`[gemini/meta] extracting article_title + speaker names (temporary bridge)`);
-  const metaRes  = await callGemini(buildNamesMsg(lines, chapters), NAMES_SCHEMA, config);
-  const metaJson = await readJson(metaRes);
-  const meta     = tryLenientParse(metaJson) ?? {};
-  const ctx = {
-    article_title: meta.article_title ?? '',
-    host_name:     meta.host_name     ?? '',
-    guest_name:    meta.guest_name     ?? '',
-  };
-  console.log(`[gemini/meta] title="${ctx.article_title}" host="${ctx.host_name}" guest="${ctx.guest_name}"`);
+  // Step 1: Names + Title in parallel. Names can fail gracefully; Title cannot.
+  console.log(`[gemini/meta] names + title calls (parallel)`);
+  const [namesSettled, titleSettled] = await Promise.allSettled([
+    callGemini(buildNamesMsg(lines, chapters), NAMES_SCHEMA, config),
+    callGemini(buildTitleMsg(lines, chapters), TITLE_SCHEMA, config),
+  ]);
 
-  // Step 2: emit preamble + N symmetric chapter calls.
+  // Title failure is terminal — abort before opening the stream.
+  if (titleSettled.status === 'rejected') {
+    throw titleSettled.reason;
+  }
+  const titleJson = await readJson(titleSettled.value);
+  const titleData = tryLenientParse(titleJson) ?? {};
+  const article_title = (titleData.article_title ?? '').trim();
+  if (!article_title) {
+    throw new Error('Title call returned empty article_title');
+  }
+
+  // Names failure → fall back to "主持人"/"嘉宾" placeholders.
+  let host_name = '主持人';
+  let guest_name = '嘉宾';
+  if (namesSettled.status === 'fulfilled') {
+    const namesJson = await readJson(namesSettled.value);
+    const namesData = tryLenientParse(namesJson) ?? {};
+    const h = (namesData.host_name  ?? '').trim();
+    const g = (namesData.guest_name ?? '').trim();
+    if (h) host_name  = h;
+    if (g) guest_name = g;
+  } else {
+    console.warn('[gemini/names] call failed, falling back to 主持人/嘉宾:', namesSettled.reason?.message);
+  }
+
+  const ctx = { article_title, host_name, guest_name };
+  console.log(`[gemini/meta] title="${article_title}" host="${host_name}" guest="${guest_name}"`);
+
+  // Step 2: preamble + N per-chapter calls (sequential).
   return makeStream(async controller => {
-    controller.enqueue(renderPreamble({ article_title: ctx.article_title }));
+    controller.enqueue(renderPreamble({ article_title }));
     for (let i = 0; i < chapters.length; i++) {
       console.log(`[gemini/ch${i + 1}] chapter ${i + 1}/${chapters.length}`);
       const res = await callGemini(
