@@ -62,22 +62,32 @@ export const CHAPTER_SCHEMA = {
 };
 
 /**
- * Metadata-only schema for the upfront speaker/title extraction call.
- * The model sees the full transcript but only outputs these three fields,
- * which then become shared context for all per-chapter calls.
+ * Names-only schema for the parallel name-extraction call.
+ * Input is snippet-extracted transcript excerpts (~1-5k chars), not the full
+ * transcript.
  *
- * Why a dedicated call: speaker names often appear mid-video (not in
- * chapter 0), so identifying them requires reading the whole transcript.
- * Outputting only metadata keeps this call cheap (~200 tokens output).
- *
- * Shape: { article_title, host_name, guest_name }
+ * Shape: { host_name, guest_name }
  */
-export const METADATA_SCHEMA = {
+export const NAMES_SCHEMA = {
+  type: 'object',
+  properties: {
+    host_name:  { type: 'string' },
+    guest_name: { type: 'string' },
+  },
+  required: ['host_name', 'guest_name'],
+};
+
+/**
+ * Title-only schema for the parallel title-extraction call.
+ * Input is the chapter list + (optionally) the first chapter's transcript
+ * when it looks like an intro/highlights chapter.
+ *
+ * Shape: { article_title }
+ */
+export const TITLE_SCHEMA = {
   type: 'object',
   properties: {
     article_title: { type: 'string' },
-    host_name:     { type: 'string' },
-    guest_name:    { type: 'string' },
   },
-  required: ['article_title', 'host_name', 'guest_name'],
+  required: ['article_title'],
 };

@@ -1,6 +1,6 @@
 // test/schema.spec.js
 import { describe, it, expect } from 'vitest';
-import { ARTICLE_SCHEMA, CHAPTER_SCHEMA, METADATA_SCHEMA } from '../src/services/schema.js';
+import { ARTICLE_SCHEMA, CHAPTER_SCHEMA, NAMES_SCHEMA, TITLE_SCHEMA } from '../src/services/schema.js';
 
 describe('ARTICLE_SCHEMA', () => {
   it('is a JSON-schema-shaped object with required top-level fields', () => {
@@ -47,13 +47,23 @@ describe('CHAPTER_SCHEMA', () => {
   });
 });
 
-describe('METADATA_SCHEMA', () => {
-  it('only requires the three preamble fields and exposes no chapter content', () => {
-    expect(METADATA_SCHEMA.type).toBe('object');
-    expect(METADATA_SCHEMA.required).toEqual(
-      expect.arrayContaining(['article_title', 'host_name', 'guest_name'])
+describe('NAMES_SCHEMA', () => {
+  it('requires only host_name and guest_name (both strings)', () => {
+    expect(NAMES_SCHEMA.type).toBe('object');
+    expect(NAMES_SCHEMA.required).toEqual(
+      expect.arrayContaining(['host_name', 'guest_name'])
     );
-    expect(Object.keys(METADATA_SCHEMA.properties)).not.toContain('chapters');
-    expect(Object.keys(METADATA_SCHEMA.properties)).not.toContain('sections');
+    expect(Object.keys(NAMES_SCHEMA.properties).sort()).toEqual(['guest_name', 'host_name']);
+    expect(NAMES_SCHEMA.properties.host_name.type).toBe('string');
+    expect(NAMES_SCHEMA.properties.guest_name.type).toBe('string');
+  });
+});
+
+describe('TITLE_SCHEMA', () => {
+  it('requires only article_title (string)', () => {
+    expect(TITLE_SCHEMA.type).toBe('object');
+    expect(TITLE_SCHEMA.required).toEqual(['article_title']);
+    expect(Object.keys(TITLE_SCHEMA.properties)).toEqual(['article_title']);
+    expect(TITLE_SCHEMA.properties.article_title.type).toBe('string');
   });
 });
