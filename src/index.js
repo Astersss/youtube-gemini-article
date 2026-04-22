@@ -36,7 +36,11 @@ async function handleArticle(searchParams, env) {
 
   let textStream;
   try {
-    textStream = await streamArticle(transcriptData, { apiKey: env.GEMINI_API_KEY, model: env.GEMINI_MODEL });
+    textStream = await streamArticle(transcriptData, {
+      apiKey: env.GEMINI_API_KEY,
+      model: env.GEMINI_MODEL,
+      interChapterDelayMs: 2000,
+    });
   } catch (err) {
     // 503/429 from Gemini → tell the client the upstream is temporarily unavailable.
     // Other Gemini failures (bad key, schema errors, etc.) → 502 Bad Gateway.

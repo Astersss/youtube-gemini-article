@@ -356,13 +356,28 @@ export async function streamArticle({ lines, chapters }, config) {
     throw new Error('Title call returned empty article_title');
   }
 
+  // If names call couldn't identify the guest, try parsing from the article title.
+  // Title format: "对话{guest_full_name}：{tagline}"
+  if (guest_name === '嘉宾') {
+    const m = article_title.match(/^对话([^：:]+)[：:]/);
+    const guestFromTitle = (m?.[1] ?? '').trim();
+    if (guestFromTitle) {
+      guest_name = guestFromTitle;
+      console.log(`[gemini/meta] guest name extracted from title: "${guest_name}"`);
+    }
+  }
+
   const ctx = { article_title, host_name, guest_name };
   console.log(`[gemini/meta] title="${article_title}" host="${host_name}" guest="${guest_name}"`);
 
   // Step 2: preamble + N per-chapter calls (sequential).
+  // interChapterDelayMs (default 0) can be set by the caller to pace requests
+  // and avoid 429 rate-limit errors when a video has many chapters.
+  const interChapterDelayMs = config.interChapterDelayMs ?? 0;
   return makeStream(async controller => {
     controller.enqueue(renderPreamble({ article_title }));
     for (let i = 0; i < chapters.length; i++) {
+      if (i > 0 && interChapterDelayMs > 0) await sleep(interChapterDelayMs);
       console.log(`[gemini/ch${i + 1}] chapter ${i + 1}/${chapters.length}`);
       const res = await callGemini(
         buildChapterMsg(i, chapters, getChapterLines(lines, chapters, i), ctx),

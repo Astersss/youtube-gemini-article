@@ -236,7 +236,8 @@ describe('streamArticle (multi-chapter: serial names → title, then per-chapter
 
     expect(md).toContain('# 对话Mark：AI革命');
     expect(md).toContain('**主持人:** q1');
-    expect(md).toContain('**嘉宾:** a1');
+    // guest name falls back → but title extraction recovers "Mark" from "对话Mark：…"
+    expect(md).toContain('**Mark:** a1');
   });
 
   it('chapter-call HTTP failure surfaces in-stream (after names+title succeed)', async () => {
