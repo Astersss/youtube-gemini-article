@@ -120,36 +120,59 @@ ${chapterBlock(i, chapters, chLines)}`;
 
 // ── Gemini API layer ──────────────────────────────────────────────────────────
 
+// Retry 503 (overloaded) and 429 (quota) with exponential backoff + jitter.
+// These are the only Gemini failures that benefit from waiting; everything
+// else (400 schema errors, 401 bad key) is terminal.
+const RETRY_STATUSES = new Set([429, 503]);
+const RETRY_DELAYS_MS = [2000, 5000, 12000];
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function callGemini(userMessage, schema, { apiKey, model }) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 32768,
-        thinkingConfig: { thinkingBudget: 0 },
-        responseMimeType: 'application/json',
-        responseSchema: schema,
-      },
-      safetySettings: SAFETY_OFF,
-    }),
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 65536,
+      thinkingConfig: { thinkingBudget: 2048 },
+      responseMimeType: 'application/json',
+      responseSchema: schema,
+    },
+    safetySettings: SAFETY_OFF,
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    if (res.status === 429) throw new Error(
-      'Gemini API quota exceeded. Please wait a minute and try again, or enable billing at aistudio.google.com.'
-    );
-    if (res.status === 503) throw new Error(
-      'Gemini model is temporarily overloaded. Please wait a minute and try again.'
-    );
-    throw new Error(`Gemini API error ${res.status}: ${body}`);
+  let lastStatus = 0;
+  let lastBody = '';
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    if (res.ok) return res;
+
+    lastStatus = res.status;
+    lastBody = await res.text();
+
+    if (!RETRY_STATUSES.has(res.status) || attempt === RETRY_DELAYS_MS.length) break;
+
+    // Full jitter: delay = random(0, base). Keeps concurrent clients from
+    // synchronizing and re-hammering the API at the same moment.
+    const base = RETRY_DELAYS_MS[attempt];
+    const delay = Math.floor(Math.random() * base);
+    console.warn(`[gemini] ${res.status} on attempt ${attempt + 1}, retrying in ${delay}ms`);
+    await sleep(delay);
   }
-  return res;
+
+  if (lastStatus === 429) throw new Error(
+    'Gemini API quota exceeded after retries. Please wait a minute and try again, or enable billing at aistudio.google.com.'
+  );
+  if (lastStatus === 503) throw new Error(
+    'Gemini model is still overloaded after retries. Please wait a minute and try again.'
+  );
+  throw new Error(`Gemini API error ${lastStatus}: ${lastBody}`);
 }
 
 /** TransformStream: SSE wire format → inner `parts[].text` strings. */
