@@ -47,7 +47,7 @@ export const ARTICLE_SCHEMA = {
 /**
  * Single-chapter schema.
  * Used for per-chapter calls.  article_title / host_name / guest_name are
- * extracted by a dedicated metadata call (see METADATA_SCHEMA) and passed
+ * extracted by dedicated Names + Title calls and passed
  * back as user-message context, not re-requested per chapter.
  *
  * Shape: { title, sections: [SectionItem] }
